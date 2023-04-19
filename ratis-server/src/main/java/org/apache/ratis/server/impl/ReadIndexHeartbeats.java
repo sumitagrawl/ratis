@@ -28,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -101,13 +102,17 @@ class ReadIndexHeartbeats {
       final HeartbeatAck reply = replies.computeIfAbsent(
           logAppender.getFollowerId(), key -> new HeartbeatAck(logAppender));
       if (reply.receive(proto)) {
-        if (hasMajority.test(id -> replies.get(id).isAcknowledged())) {
+        if (hasMajority.test(this::isAcknowledged)) {
           future.complete(commitIndex);
           return true;
         }
       }
 
       return isCompletedNormally();
+    }
+
+    boolean isAcknowledged(RaftPeerId id) {
+      return Optional.ofNullable(replies.get(id)).filter(HeartbeatAck::isAcknowledged).isPresent();
     }
 
     boolean isCompletedNormally() {
@@ -124,12 +129,12 @@ class ReadIndexHeartbeats {
 
     synchronized void onAppendEntriesReply(LogAppender appender, AppendEntriesReplyProto reply,
                                            Predicate<Predicate<RaftPeerId>> hasMajority) {
-      final long callId = reply.getServerReply().getCallId();
+      final long followerCommit = reply.getFollowerCommit();
 
       Iterator<Map.Entry<Long, AppendEntriesListener>> iterator = sorted.entrySet().iterator();
       while (iterator.hasNext()) {
         Map.Entry<Long, AppendEntriesListener> entry = iterator.next();
-        if (entry.getKey() > callId) {
+        if (entry.getKey() > followerCommit) {
           return;
         }
 

@@ -92,7 +92,9 @@ class GrpcServerProtocolService extends RaftServerProtocolServiceImplBase {
 
     private void handleError(Throwable e, REQUEST request) {
       GrpcUtil.warn(LOG, () -> getId() + ": Failed " + op + " request " + requestToString(request), e);
-      responseObserver.onError(wrapException(e, request));
+      if (isClosed.compareAndSet(false, true)) {
+        responseObserver.onError(wrapException(e, request));
+      }
     }
 
     private synchronized void handleReply(REPLY reply) {
@@ -146,7 +148,7 @@ class GrpcServerProtocolService extends RaftServerProtocolServiceImplBase {
     }
     @Override
     public void onError(Throwable t) {
-      GrpcUtil.warn(LOG, () -> getId() + ": installSnapshot onError, lastRequest: " + getPreviousRequestString(), t);
+      GrpcUtil.warn(LOG, () -> getId() + ": "+ op + " onError, lastRequest: " + getPreviousRequestString(), t);
       if (isClosed.compareAndSet(false, true)) {
         Status status = Status.fromThrowable(t);
         if (status != null && status.getCode() != Status.Code.CANCELLED) {

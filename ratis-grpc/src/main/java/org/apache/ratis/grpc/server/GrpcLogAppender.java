@@ -23,7 +23,6 @@ import org.apache.ratis.grpc.GrpcUtil;
 import org.apache.ratis.grpc.metrics.GrpcServerMetrics;
 import org.apache.ratis.metrics.Timekeeper;
 import org.apache.ratis.proto.RaftProtos.InstallSnapshotResult;
-import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
@@ -49,7 +48,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A new log appender implementation using grpc bi-directional stream API.
@@ -71,10 +69,9 @@ public class GrpcLogAppender extends LogAppenderBase {
   private final boolean installSnapshotEnabled;
 
   private final TimeDuration requestTimeoutDuration;
+  private final TimeDuration installSnapshotStreamTimeout;
+  private final int maxOutstandingInstallSnapshots;
   private final TimeoutExecutor scheduler = TimeoutExecutor.getInstance();
-
-  private final long waitTimeMinMs;
-  private final AtomicReference<Timestamp> lastAppendEntries;
 
   private volatile StreamObservers appendLogRequestObserver;
   private final boolean useSeparateHBChannel;
@@ -92,12 +89,11 @@ public class GrpcLogAppender extends LogAppenderBase {
     final RaftProperties properties = server.getRaftServer().getProperties();
     this.maxPendingRequestsNum = GrpcConfigKeys.Server.leaderOutstandingAppendsMax(properties);
     this.requestTimeoutDuration = RaftServerConfigKeys.Rpc.requestTimeout(properties);
+    this.maxOutstandingInstallSnapshots = GrpcConfigKeys.Server.installSnapshotRequestElementLimit(properties);
+    this.installSnapshotStreamTimeout = GrpcConfigKeys.Server.installSnapshotRequestTimeout(properties)
+        .multiply(maxOutstandingInstallSnapshots);
     this.installSnapshotEnabled = RaftServerConfigKeys.Log.Appender.installSnapshotEnabled(properties);
     this.useSeparateHBChannel = GrpcConfigKeys.Server.heartbeatChannel(properties);
-
-    final TimeDuration waitTimeMin = RaftServerConfigKeys.Log.Appender.waitTimeMin(properties);
-    this.waitTimeMinMs = waitTimeMin.toLong(TimeUnit.MILLISECONDS);
-    this.lastAppendEntries = new AtomicReference<>(Timestamp.currentTime().addTime(waitTimeMin.negate()));
 
     grpcServerMetrics = new GrpcServerMetrics(server.getMemberId().toString());
     grpcServerMetrics.addPendingRequestsCount(getFollowerId().toString(), pendingRequests::logRequestsSize);
@@ -122,13 +118,17 @@ public class GrpcLogAppender extends LogAppenderBase {
       firstResponseReceived = false;
       // clear the pending requests queue and reset the next index of follower
       pendingRequests.clear();
+      final FollowerInfo f = getFollower();
       final long nextIndex = 1 + Optional.ofNullable(request)
           .map(AppendEntriesRequest::getPreviousLog)
           .map(TermIndex::getIndex)
-          .orElseGet(getFollower()::getMatchIndex);
-      if (onError && getFollower().getMatchIndex() == 0 && request == null) {
-        LOG.warn("{}: Leader has not got in touch with Follower {} yet, " +
-          "just keep nextIndex unchanged and retry.", this, getFollower());
+          .orElseGet(f::getMatchIndex);
+      if (onError && f.getMatchIndex() == 0 && request == null) {
+        LOG.warn("{}: Follower failed when matchIndex == 0, " +
+          " keep nextIndex ({}) unchanged and retry.", this, f.getNextIndex());
+        return;
+      }
+      if (request != null && request.isHeartbeat()) {
         return;
       }
       getFollower().decreaseNextIndex(nextIndex);
@@ -180,10 +180,9 @@ public class GrpcLogAppender extends LogAppenderBase {
       // For normal nodes, new entries should be sent ASAP
       // however for slow followers (especially when the follower is down),
       // keep sending without any wait time only ends up in high CPU load
-      final long min = waitTimeMinMs - lastAppendEntries.get().elapsedTimeMs();
-      return Math.max(0L, min);
+      return Math.max(getMinWaitTimeMs(), 0L);
     }
-    return Math.min(waitTimeMinMs, getHeartbeatWaitTimeMs());
+    return getHeartbeatWaitTimeMs();
   }
 
   private boolean isSlowFollower() {
@@ -261,13 +260,13 @@ public class GrpcLogAppender extends LogAppenderBase {
     return CALL_ID_COMPARATOR;
   }
 
-  private void appendLog(boolean excludeLogEntries) throws IOException {
+  private void appendLog(boolean heartbeat) throws IOException {
     final AppendEntriesRequestProto pending;
     final AppendEntriesRequest request;
     try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
       // Prepare and send the append request.
       // Note changes on follower's nextIndex and ops on pendingRequests should always be done under the write-lock
-      pending = newAppendEntriesRequest(callId.getAndIncrement(), excludeLogEntries);
+      pending = newAppendEntriesRequest(callId.getAndIncrement(), heartbeat);
       if (pending == null) {
         return;
       }
@@ -280,6 +279,16 @@ public class GrpcLogAppender extends LogAppenderBase {
       }
     }
 
+    final long waitMs = getMinWaitTimeMs();
+    if (waitMs > 0) {
+      try {
+        Thread.sleep(waitMs);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw IOUtils.toInterruptedIOException(
+            "Interrupted appendLog, heartbeat? " + heartbeat, e);
+      }
+    }
     if (isRunning()) {
       sendRequest(request, pending);
     }
@@ -293,15 +302,14 @@ public class GrpcLogAppender extends LogAppenderBase {
         .map(observer -> {
           request.startRequestTimer();
           observer.onNext(proto);
-          lastAppendEntries.set(Timestamp.currentTime());
           return true;
         }).isPresent();
 
     if (sent) {
+      getFollower().updateLastRpcSendTime(request.isHeartbeat());
       scheduler.onTimeout(requestTimeoutDuration,
           () -> timeoutAppendRequest(request.getCallId(), request.isHeartbeat()),
           LOG, () -> "Timeout check failed for append entry request: " + request);
-      getFollower().updateLastRpcSendTime(request.isHeartbeat());
     }
   }
 
@@ -321,8 +329,10 @@ public class GrpcLogAppender extends LogAppenderBase {
     }
   }
 
-  private void increaseNextIndex(final long installedSnapshotIndex) {
-    getFollower().updateNextIndex(installedSnapshotIndex + 1);
+  private void increaseNextIndex(final long installedSnapshotIndex, Object reason) {
+    final long newNextIndex = installedSnapshotIndex + 1;
+    LOG.info("{}: updateNextIndex {} for {}", this, newNextIndex, reason);
+    getFollower().updateNextIndex(newNextIndex);
   }
 
   /**
@@ -378,12 +388,14 @@ public class GrpcLogAppender extends LogAppenderBase {
           break;
         case NOT_LEADER:
           grpcServerMetrics.onRequestNotLeader(getFollowerId().toString());
+          LOG.warn("{}: received {} reply with term {}", this, reply.getResult(), reply.getTerm());
           if (onFollowerTerm(reply.getTerm())) {
             return;
           }
           break;
         case INCONSISTENCY:
           grpcServerMetrics.onRequestInconsistency(getFollowerId().toString());
+          LOG.warn("{}: received {} reply with nextIndex {}", this, reply.getResult(), reply.getNextIndex());
           updateNextIndex(reply.getNextIndex());
           break;
         default:
@@ -463,12 +475,12 @@ public class GrpcLogAppender extends LogAppenderBase {
       if (followerNextIndex >= leaderStartIndex) {
         LOG.info("{}: Follower can catch up leader after install the snapshot, as leader's start index is {}",
             this, followerNextIndex);
-        notifyInstallSnapshotFinished(InstallSnapshotResult.SUCCESS, followerSnapshotIndex, getFollower().getPeer());
+        notifyInstallSnapshotFinished(InstallSnapshotResult.SUCCESS, followerSnapshotIndex);
       }
     }
 
-    void notifyInstallSnapshotFinished(InstallSnapshotResult result, long snapshotIndex, RaftPeer peer) {
-      getServer().getStateMachine().event().notifySnapshotInstalled(result, snapshotIndex, peer);
+    void notifyInstallSnapshotFinished(InstallSnapshotResult result, long snapshotIndex) {
+      getServer().getStateMachine().event().notifySnapshotInstalled(result, snapshotIndex, getFollower().getPeer());
     }
 
     boolean isDone() {
@@ -516,7 +528,7 @@ public class GrpcLogAppender extends LogAppenderBase {
           getFollower().setSnapshotIndex(followerSnapshotIndex);
           getFollower().setAttemptedToInstallSnapshot();
           getLeaderState().onFollowerCommitIndex(getFollower(), followerSnapshotIndex);
-          increaseNextIndex(followerSnapshotIndex);
+          increaseNextIndex(followerSnapshotIndex, reply.getResult());
           removePending(reply);
           break;
         case NOT_LEADER:
@@ -533,19 +545,18 @@ public class GrpcLogAppender extends LogAppenderBase {
           getFollower().setSnapshotIndex(followerSnapshotIndex);
           getFollower().setAttemptedToInstallSnapshot();
           getLeaderState().onFollowerCommitIndex(getFollower(), followerSnapshotIndex);
-          increaseNextIndex(followerSnapshotIndex);
+          increaseNextIndex(followerSnapshotIndex, reply.getResult());
           onFollowerCatchup(followerSnapshotIndex);
           removePending(reply);
           break;
         case SNAPSHOT_UNAVAILABLE:
           LOG.info("{}: Follower could not install snapshot as it is not available.", this);
           getFollower().setAttemptedToInstallSnapshot();
-          notifyInstallSnapshotFinished(InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, RaftLog.INVALID_LOG_INDEX,
-              getFollower().getPeer());
+          notifyInstallSnapshotFinished(InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, RaftLog.INVALID_LOG_INDEX);
           removePending(reply);
           break;
         case UNRECOGNIZED:
-          LOG.error("Unrecongnized the reply result {}: Leader is {}, follower is {}",
+          LOG.error("Unrecognized the reply result {}: Leader is {}, follower is {}",
               reply.getResult(), getServer().getId(), getFollowerId());
           break;
         default:
@@ -591,7 +602,9 @@ public class GrpcLogAppender extends LogAppenderBase {
     StreamObserver<InstallSnapshotRequestProto> snapshotRequestObserver = null;
     final String requestId = UUID.randomUUID().toString();
     try {
-      snapshotRequestObserver = getClient().installSnapshot(responseHandler);
+      snapshotRequestObserver = getClient().installSnapshot(
+          getFollower().getName() + "-installSnapshot-" + requestId,
+          installSnapshotStreamTimeout, maxOutstandingInstallSnapshots, responseHandler);
       for (InstallSnapshotRequestProto request : newInstallSnapshotRequests(requestId, snapshot)) {
         if (isRunning()) {
           snapshotRequestObserver.onNext(request);
@@ -641,7 +654,9 @@ public class GrpcLogAppender extends LogAppenderBase {
       LOG.info("{}: send {}", this, ServerStringUtils.toInstallSnapshotRequestString(request));
     }
     try {
-      snapshotRequestObserver = getClient().installSnapshot(responseHandler);
+      snapshotRequestObserver = getClient().installSnapshot(getFollower().getName() + "-notifyInstallSnapshot",
+          requestTimeoutDuration, 0, responseHandler);
+
       snapshotRequestObserver.onNext(request);
       getFollower().updateLastRpcSendTime(false);
       responseHandler.addPending(request);

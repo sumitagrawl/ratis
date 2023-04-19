@@ -30,7 +30,6 @@ import java.io.InputStream;
 import java.nio.file.Path;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
-import java.util.Optional;
 
 /** Read {@link FileChunkProto}s from a file. */
 public class FileChunkReader implements Closeable {
@@ -47,15 +46,12 @@ public class FileChunkReader implements Closeable {
    * Construct a reader from a file specified by the given {@link FileInfo}.
    *
    * @param info the information of the file.
-   * @param directory the directory where the file is stored.
+   * @param relativePath the relative path of the file.
    * @throws IOException if it failed to open the file.
    */
-  public FileChunkReader(FileInfo info, RaftStorageDirectory directory) throws IOException {
+  public FileChunkReader(FileInfo info, Path relativePath) throws IOException {
     this.info = info;
-    this.relativePath = Optional.of(info.getPath())
-        .filter(Path::isAbsolute)
-        .map(p -> directory.getRoot().toPath().relativize(p))
-        .orElse(info.getPath());
+    this.relativePath = relativePath;
     final File f = info.getPath().toFile();
     if (info.getFileDigest() == null) {
       digester = MD5Hash.getDigester();
@@ -77,14 +73,21 @@ public class FileChunkReader implements Closeable {
     final long remaining = info.getFileSize() - offset;
     final int chunkLength = remaining < chunkMaxSize ? (int) remaining : chunkMaxSize;
     final ByteString data = ByteString.readFrom(in, chunkLength);
-    final ByteString fileDigest = ByteString.copyFrom(
-            digester != null? digester.digest(): info.getFileDigest().getDigest());
+    // whether this chunk is the last chunk of current file
+    final boolean isDone = offset + chunkLength == info.getFileSize();
+    final ByteString fileDigest;
+    if (digester != null) {
+      // file digest is calculated once in the end and shipped with last FileChunkProto
+      fileDigest = isDone ? ByteString.copyFrom(digester.digest()) : ByteString.EMPTY;
+    } else {
+      fileDigest = ByteString.copyFrom(info.getFileDigest().getDigest());
+    }
 
     final FileChunkProto proto = FileChunkProto.newBuilder()
         .setFilename(relativePath.toString())
         .setOffset(offset)
         .setChunkIndex(chunkIndex)
-        .setDone(offset + chunkLength == info.getFileSize())
+        .setDone(isDone)
         .setData(data)
         .setFileDigest(fileDigest)
         .build();
